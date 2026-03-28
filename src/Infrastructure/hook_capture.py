@@ -13,7 +13,7 @@ from src.Application.models import HookCaptureResult
 
 from .ffmpeg_tools import FfmpegTools
 from .qsv_offline import QsvOfflineDecoder
-from .runtime_paths import get_runtime_dir
+from .runtime_paths import get_default_qyclient_paths, get_runtime_dir
 
 try:
     import frida  # type: ignore
@@ -352,6 +352,7 @@ class HookCapture:
 
     def _find_qyclient_path(self) -> Path | None:
         candidates = [
+            *get_default_qyclient_paths(),
             Path(r"C:\Program Files\IQIYI Video\LStyle\14.3.0.9857\QyClient.exe"),
             Path(r"C:\Program Files\IQIYI Video\QyClient.exe"),
             Path(r"C:\Program Files (x86)\IQIYI Video\QyClient.exe"),
@@ -380,6 +381,31 @@ class HookCapture:
             return None
         return None
 
+    def _close_launched_client(self, process: subprocess.Popen[Any] | None) -> None:
+        if process is None:
+            return
+        pid = process.pid
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                subprocess.run(
+                    [
+                        "taskkill",
+                        "/PID",
+                        str(pid),
+                        "/T",
+                        "/F",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
     def capture(
         self,
         sample_path: Path,
@@ -397,6 +423,7 @@ class HookCapture:
         known_pids: set[int] = set()
         sessions = []
         scripts = []
+        launched_process: subprocess.Popen[Any] | None = None
 
         def attach_matching_processes() -> None:
             for process in device.enumerate_processes():
@@ -449,26 +476,29 @@ class HookCapture:
             launcher = self._find_qyclient_path()
             if launcher is not None:
                 try:
-                    subprocess.Popen([str(launcher), str(sample_path)])
+                    launched_process = subprocess.Popen([str(launcher), str(sample_path)])
                 except Exception:
                     os.startfile(str(sample_path))
             else:
                 os.startfile(str(sample_path))
 
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            attach_matching_processes()
-            time.sleep(0.5)
-        for script in scripts:
-            try:
-                script.unload()
-            except Exception:
-                pass
-        for session in sessions:
-            try:
-                session.detach()
-            except Exception:
-                pass
+        try:
+            deadline = time.time() + timeout_sec
+            while time.time() < deadline:
+                attach_matching_processes()
+                time.sleep(0.5)
+        finally:
+            for script in scripts:
+                try:
+                    script.unload()
+                except Exception:
+                    pass
+            for session in sessions:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+            self._close_launched_client(launched_process)
 
         with open(work_capture / "events.json", "w", encoding="utf-8") as handle:
             json.dump(events, handle, ensure_ascii=False, indent=2)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import subprocess
 import time
@@ -115,6 +116,118 @@ class FfmpegTools:
             "audio_codec": audio_codec or "",
             "video_tag": "hvc1" if video_codec == "hevc" else "",
             "command": command,
+        }
+
+    def sample_gray_frame_stats(self, media_path: Path, timestamps: list[float]) -> list[dict[str, float]]:
+        self.ensure_available()
+        stats: list[dict[str, float]] = []
+        for ts in timestamps:
+            command = [
+                str(self.ffmpeg_path),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{max(0.0, float(ts)):.3f}",
+                "-i",
+                str(media_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=160:90,format=gray",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+            )
+            if completed.returncode != 0 or not completed.stdout:
+                continue
+            stats.append(self._gray_frame_stats(completed.stdout))
+        return stats
+
+    def decode_video_health(self, media_path: Path) -> dict[str, float]:
+        self.ensure_available()
+        command = [
+            str(self.ffmpeg_path),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        decoded_video_sec = 0.0
+        for line in completed.stdout.splitlines():
+            if not line.startswith("out_time_ms="):
+                continue
+            try:
+                decoded_video_sec = max(decoded_video_sec, int(line.split("=", 1)[1]) / 1_000_000.0)
+            except ValueError:
+                continue
+        error_lines = sum(1 for line in completed.stderr.splitlines() if line.strip())
+        return {
+            "decoded_video_sec": round(decoded_video_sec, 6),
+            "decode_error_lines": float(error_lines),
+        }
+
+    @staticmethod
+    def _gray_frame_stats(frame_bytes: bytes) -> dict[str, float]:
+        total = len(frame_bytes)
+        if total == 0:
+            return {
+                "mean": 0.0,
+                "stddev": 0.0,
+                "entropy": 0.0,
+                "dominant_ratio": 1.0,
+                "unique_values": 0.0,
+            }
+        counts = [0] * 256
+        acc = 0
+        for value in frame_bytes:
+            counts[value] += 1
+            acc += value
+        mean = acc / total
+        variance = 0.0
+        entropy = 0.0
+        dominant = 0
+        unique_values = 0
+        for count in counts:
+            if count == 0:
+                continue
+            unique_values += 1
+            dominant = max(dominant, count)
+            diff = (count / total)
+            entropy -= diff * math.log2(diff)
+        for value, count in enumerate(counts):
+            if count:
+                variance += ((value - mean) ** 2) * count
+        variance /= total
+        return {
+            "mean": round(mean, 4),
+            "stddev": round(math.sqrt(variance), 4),
+            "entropy": round(entropy, 6),
+            "dominant_ratio": round(dominant / total, 6),
+            "unique_values": float(unique_values),
         }
 
     @staticmethod

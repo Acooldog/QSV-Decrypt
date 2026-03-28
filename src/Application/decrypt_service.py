@@ -5,9 +5,23 @@ import json
 import logging
 import shutil
 import time
+from dataclasses import asdict
 from pathlib import Path
 
-from .models import BatchReport, FileDecryptResult, TimingBreakdown
+from .models import (
+    BatchReport,
+    DbCorrelation,
+    DbSnapshot,
+    FileDecryptResult,
+    QsvInspection,
+    SegmentRebuildPlan,
+    TimingBreakdown,
+)
+from src.Infrastructure.bbts_variant_rebuilder import BbtsVariantRebuilder
+from src.Infrastructure.db_cache_analysis import DbCacheAnalyzer
+from src.Infrastructure.db_open_sample_prototype import DbOpenSamplePrototype
+from src.Infrastructure.db_prototype_rebuilder import DbPrototypeRebuilder
+from src.Infrastructure.db_snapshot import DbSnapshotService
 from src.Infrastructure.ffmpeg_tools import FfmpegTools
 from src.Infrastructure.qsv_offline import QsvOfflineDecoder
 from src.Infrastructure.runtime_paths import get_log_day_dir
@@ -21,13 +35,127 @@ class DecryptService:
         self,
         decoder: QsvOfflineDecoder,
         ffmpeg_tools: FfmpegTools,
+        db_snapshot_service: DbSnapshotService | None = None,
+        db_cache_analyzer: DbCacheAnalyzer | None = None,
+        db_prototype_rebuilder: DbPrototypeRebuilder | None = None,
+        db_open_sample_prototype: DbOpenSamplePrototype | None = None,
+        bbts_variant_rebuilder: BbtsVariantRebuilder | None = None,
     ) -> None:
         self.decoder = decoder
         self.ffmpeg_tools = ffmpeg_tools
+        self.db_snapshot_service = db_snapshot_service or DbSnapshotService()
+        self.db_cache_analyzer = db_cache_analyzer or DbCacheAnalyzer()
+        self.db_prototype_rebuilder = db_prototype_rebuilder or DbPrototypeRebuilder(
+            decoder=self.decoder,
+            ffmpeg_tools=self.ffmpeg_tools,
+        )
+        self.db_open_sample_prototype = db_open_sample_prototype or DbOpenSamplePrototype(
+            snapshot_service=self.db_snapshot_service,
+            cache_analyzer=self.db_cache_analyzer,
+            decoder=self.decoder,
+        )
+        self.bbts_variant_rebuilder = bbts_variant_rebuilder or BbtsVariantRebuilder(
+            ffmpeg_tools=self.ffmpeg_tools,
+        )
 
     def inspect(self, sample_path: Path) -> dict:
         inspection = self.decoder.inspect(sample_path)
+        snapshot = self.db_snapshot_service.create_snapshot("hot")
+        correlation = self.db_cache_analyzer.inspect_snapshot(
+            snapshot=snapshot,
+            sample_path=sample_path,
+            qsv_inspection=inspection,
+        )
+        inspection.db_correlation = correlation
         return inspection.to_dict()
+
+    def snapshot_db(self, mode: str) -> dict:
+        snapshot = self.db_snapshot_service.create_snapshot(mode)
+        return snapshot.to_dict()
+
+    def inspect_db(self, sample_path: Path, snapshot_mode: str) -> dict:
+        inspection = self.decoder.inspect(sample_path)
+        snapshot = self.db_snapshot_service.create_snapshot(snapshot_mode)
+        correlation = self.db_cache_analyzer.inspect_snapshot(
+            snapshot=snapshot,
+            sample_path=sample_path,
+            qsv_inspection=inspection,
+        )
+        inspection.db_correlation = correlation
+        return {
+            "inspection": inspection.to_dict(),
+            "snapshot": snapshot.to_dict(),
+            "db_correlation": correlation.to_dict(),
+        }
+
+    def prototype_db_rebuild(
+        self,
+        sample_path: Path,
+        snapshot_mode: str,
+        output_root: Path | None = None,
+    ) -> dict:
+        inspection = self.decoder.inspect(sample_path)
+        snapshot = self.db_snapshot_service.create_snapshot(snapshot_mode)
+        correlation = self.db_cache_analyzer.inspect_snapshot(
+            snapshot=snapshot,
+            sample_path=sample_path,
+            qsv_inspection=inspection,
+        )
+        inspection.db_correlation = correlation
+        plan = self.db_prototype_rebuilder.rebuild(
+            sample_path=sample_path,
+            snapshot=snapshot,
+            db_correlation=correlation,
+            inspection=inspection,
+            output_root=output_root,
+        )
+        return {
+            "inspection": inspection.to_dict(),
+            "snapshot": snapshot.to_dict(),
+            "db_correlation": correlation.to_dict(),
+            "prototype_plan": plan.to_dict(),
+        }
+
+    def prototype_open_diff(
+        self,
+        sample_path: Path,
+        wait_sec: int,
+        client_path: Path | None = None,
+    ) -> dict:
+        return self.db_open_sample_prototype.run(
+            sample_path=sample_path,
+            wait_sec=wait_sec,
+            client_path=client_path,
+        )
+
+    def compare_db_snapshots(
+        self,
+        sample_path: Path,
+        before_snapshot: Path,
+        after_snapshot: Path,
+    ) -> dict:
+        return self.db_open_sample_prototype.compare_snapshots(
+            sample_path=sample_path,
+            before_root=before_snapshot,
+            after_root=after_snapshot,
+        )
+
+    def prototype_bbts_rebuild(
+        self,
+        sample_path: Path,
+        segments_dir: Path,
+        dispatch_json_path: Path,
+        output_root: Path | None = None,
+    ) -> dict:
+        plan = self.bbts_variant_rebuilder.rebuild(
+            sample_path=sample_path,
+            segments_dir=segments_dir,
+            dispatch_json_path=dispatch_json_path,
+            output_root=output_root,
+        )
+        return {
+            "prototype_plan": plan.to_dict(),
+        }
 
     def decrypt_batch(
         self,
@@ -170,6 +298,17 @@ class DecryptService:
 
             timeline_issue = self._validate_timeline(probe_summary)
             if timeline_issue is not None:
+                inspection = self._ensure_db_correlation(qsv_path, inspection)
+                bbts_result = self._try_bbts_repair_publish(
+                    qsv_path=qsv_path,
+                    inspection=inspection,
+                    work_dir=work_dir,
+                    final_output_path=final_output_path,
+                    timing=timing,
+                )
+                if bbts_result is not None:
+                    return bbts_result
+
                 inspection_for_failure = copy.deepcopy(inspection) if inspection else None
                 if inspection_for_failure is not None:
                     inspection_for_failure.notes.append(timeline_issue)
@@ -268,6 +407,202 @@ class DecryptService:
         )
         logger.info("batch_report_json=%s", report_json)
         logger.info("batch_report_txt=%s", report_txt)
+
+    def _try_bbts_repair_publish(
+        self,
+        qsv_path: Path,
+        inspection,
+        work_dir: Path,
+        final_output_path: Path,
+        timing: TimingBreakdown,
+    ) -> FileDecryptResult | None:
+        if not inspection or not self._is_bbts_repair_candidate(inspection):
+            return None
+
+        bbts_root = get_log_day_dir() / "bbts_repair"
+        existing = self._load_existing_bbts_success(qsv_path, bbts_root)
+        plan = existing
+        if plan is None:
+            segments_dir, dispatch_json_path = self._materialize_bbts_inputs(
+                qsv_path=qsv_path,
+                inspection=inspection,
+                work_dir=work_dir,
+            )
+            rebuild_start = time.perf_counter()
+            plan = self.bbts_variant_rebuilder.rebuild(
+                sample_path=qsv_path,
+                segments_dir=segments_dir,
+                dispatch_json_path=dispatch_json_path,
+                output_root=bbts_root / qsv_path.stem,
+            )
+            timing.remux_sec += time.perf_counter() - rebuild_start
+
+        if plan is None or plan.status != "success" or not plan.output_mp4_path or not plan.output_mp4_path.exists():
+            return None
+        if not self._is_confident_bbts_plan(plan):
+            logger.warning("%s: bbts repair output is visually untrusted; refusing publish.", qsv_path.name)
+            return None
+
+        publish_start = time.perf_counter()
+        self._publish(plan.output_mp4_path, final_output_path)
+        timing.publish_sec += time.perf_counter() - publish_start
+        probe_summary = plan.final_probe_summary
+        return FileDecryptResult(
+            input_path=qsv_path,
+            output_path=final_output_path,
+            status="success",
+            reason="ok",
+            source="offline+bbts-repair",
+            inspection=inspection,
+            probe_summary=probe_summary,
+            timing=timing,
+            remux_detail={
+                "mode": "bbts-repair",
+                "output_bytes": plan.output_mp4_path.stat().st_size,
+                "artifact_root": str((bbts_root / qsv_path.stem)),
+            },
+        )
+
+    @staticmethod
+    def _is_confident_bbts_plan(plan) -> bool:
+        if not plan.segment_results:
+            return False
+        for segment in plan.segment_results:
+            if segment.segment_index == 0:
+                continue
+            selected = segment.selected_candidate
+            if selected is None:
+                return False
+            top_candidates = list(segment.top_candidates or [])
+            if len(top_candidates) < 2:
+                continue
+            first = top_candidates[0]
+            second = top_candidates[1]
+            if (
+                first.score == second.score
+                and (
+                    first.operation != second.operation
+                    or first.key_hex != second.key_hex
+                    or first.candidate_name != second.candidate_name
+                )
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _is_bbts_repair_candidate(inspection) -> bool:
+        correlation = getattr(inspection, "db_correlation", None)
+        alignment = getattr(correlation, "qtplog_segment_alignment", None) if correlation else None
+        if not isinstance(alignment, dict):
+            return False
+        if not alignment.get("run_segment_count_match"):
+            return False
+        bbts_segnums = alignment.get("bbts_segnums") or []
+        return bool(bbts_segnums)
+
+    def _ensure_db_correlation(self, qsv_path: Path, inspection):
+        if inspection is None:
+            return inspection
+        if getattr(inspection, "db_correlation", None) is not None:
+            return inspection
+        try:
+            snapshot = self.db_snapshot_service.create_snapshot("hot")
+            correlation = self.db_cache_analyzer.inspect_snapshot(
+                snapshot=snapshot,
+                sample_path=qsv_path,
+                qsv_inspection=inspection,
+            )
+            inspection.db_correlation = correlation
+        except Exception as exc:
+            logger.warning("%s: failed to enrich db_correlation for bbts repair: %s", qsv_path.name, exc)
+        return inspection
+
+    @staticmethod
+    def _materialize_bbts_inputs(
+        qsv_path: Path,
+        inspection,
+        work_dir: Path,
+    ) -> tuple[Path, Path]:
+        segments_dir = work_dir / "bbts_segments"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        qsv_bytes = qsv_path.read_bytes()
+        for index, run in enumerate(inspection.stable_runs):
+            start = int(run.offset)
+            end = start + int(run.length)
+            (segments_dir / f"{index:02d}.ts").write_bytes(qsv_bytes[start:end])
+
+        dispatch_json_path = work_dir / "bbts_dispatch_hits.json"
+        correlation = inspection.db_correlation
+        tasks = list(getattr(correlation, "qtplog_segment_tasks", []) or [])
+        tasks.sort(key=lambda item: (int(item.get("segnum", -1)) if isinstance(item.get("segnum"), int) else -1, str(item.get("log_path", "")), int(item.get("line_no", 0))))
+        dispatch_json_path.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        return segments_dir, dispatch_json_path
+
+    @staticmethod
+    def _load_existing_bbts_success(qsv_path: Path, bbts_root: Path):
+        report_candidates: list[Path] = []
+        successful_reports: list[Path] = []
+        direct_report = bbts_root / qsv_path.stem / f"{qsv_path.stem}.bbts_repair.json"
+        if direct_report.exists():
+            report_candidates.append(direct_report)
+        if bbts_root.exists():
+            expected_output_name = f"{qsv_path.stem}.patched.mp4"
+            for candidate in bbts_root.rglob("*.bbts_repair.json"):
+                if candidate == direct_report:
+                    continue
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    continue
+                if payload.get("status") == "success":
+                    output_mp4_path = payload.get("output_mp4_path")
+                    if isinstance(output_mp4_path, str) and Path(output_mp4_path).exists():
+                        successful_reports.append(candidate)
+                output_mp4_path = payload.get("output_mp4_path")
+                sample_path = payload.get("sample_path")
+                if isinstance(output_mp4_path, str) and Path(output_mp4_path).name == expected_output_name:
+                    report_candidates.append(candidate)
+                    continue
+                if isinstance(sample_path, str) and Path(sample_path).name == qsv_path.name:
+                    report_candidates.append(candidate)
+
+        if not report_candidates and len(successful_reports) == 1:
+            report_candidates = successful_reports
+
+        for report_path in report_candidates:
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8-sig"))
+            except Exception:
+                continue
+            if payload.get("status") != "success":
+                continue
+            output_mp4_path = payload.get("output_mp4_path")
+            if not isinstance(output_mp4_path, str):
+                continue
+            output_mp4 = Path(output_mp4_path)
+            if not output_mp4.exists():
+                continue
+            summary = payload.get("final_probe_summary") or {}
+            from .models import BbtsRepairPlan, ProbeSummary
+            return BbtsRepairPlan(
+                sample_path=qsv_path,
+                segments_dir=Path(payload.get("segments_dir") or bbts_root),
+                dispatch_json_path=Path(payload.get("dispatch_json_path") or bbts_root),
+                status="success",
+                output_mp4_path=output_mp4,
+                final_probe_summary=ProbeSummary(
+                    ok=bool(summary.get("ok")),
+                    format_name=str(summary.get("format_name") or ""),
+                    duration_sec=float(summary.get("duration_sec") or 0.0),
+                    stream_count=int(summary.get("stream_count") or 0),
+                    video_streams=int(summary.get("video_streams") or 0),
+                    audio_streams=int(summary.get("audio_streams") or 0),
+                    raw=summary.get("raw") or {},
+                ),
+                notes=list(payload.get("notes") or []),
+                artifact_paths=[Path(item) for item in (payload.get("artifact_paths") or []) if isinstance(item, str)],
+            )
+        return None
 
     @staticmethod
     def _validate_timeline(probe_summary) -> str | None:

@@ -23,7 +23,21 @@ def get_default_output_root() -> Path:
     return get_runtime_dir() / "output"
 
 
+def get_default_cache_root() -> Path:
+    return Path(r"O:\qycache\temp_cache")
+
+
+def get_default_qtplog_root() -> Path:
+    return Path(r"C:\Users\01080\AppData\Roaming\IQIYI Video\LStyle\qtplog\ppslog")
+
+
+def get_default_qyclient_paths() -> list[Path]:
+    return [
+        Path(r"C:\Program Files\Common Files\IQIYI Video\LStyle\QyClient.exe"),
+        Path(r"C:\Program Files\IQIYI Video\LStyle\QyClient.exe"),
+    ]
+
+
 def get_log_day_dir(now: datetime | None = None) -> Path:
     now = now or datetime.now()
     return get_runtime_dir() / "_log" / f"{now.year}-{now.month}-{now.day}"
-
