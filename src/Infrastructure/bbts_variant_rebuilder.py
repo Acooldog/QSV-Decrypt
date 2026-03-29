@@ -1120,10 +1120,12 @@ class BbtsVariantRebuilder:
                 dispatch_entry.get("dispatch_urls", []) or [],
                 extra_values=[
                     dispatch_entry.get("dash_iv"),
+                    dispatch_entry.get("dash_ticket"),
                     dispatch_entry.get("moviejson_iv"),
                     dispatch_entry.get("moviejson_eak"),
                     dispatch_entry.get("moviejson_ms"),
                     dispatch_entry.get("moviejson_ml"),
+                    dispatch_entry.get("moviejson_ticket"),
                 ],
             )
         )
@@ -1135,10 +1137,12 @@ class BbtsVariantRebuilder:
                 list(dispatch_entry.get("cube_dispatch_urls", []) or []) + list(dispatch_entry.get("moviejson_play_ts_urls", []) or []),
                 extra_values=[
                     dispatch_entry.get("dash_iv"),
+                    dispatch_entry.get("dash_ticket"),
                     dispatch_entry.get("moviejson_iv"),
                     dispatch_entry.get("moviejson_eak"),
                     dispatch_entry.get("moviejson_ms"),
                     dispatch_entry.get("moviejson_ml"),
+                    dispatch_entry.get("moviejson_ticket"),
                 ],
             )
         )
@@ -1352,6 +1356,32 @@ class BbtsVariantRebuilder:
         if raw_hex:
             add(prefix, raw_hex)
 
+        if "%" in text:
+            try:
+                unquoted = urllib.parse.unquote(text)
+            except Exception:
+                unquoted = ""
+            if unquoted and unquoted != text:
+                for name, key_bytes in self._collect_text_key_sources(f"{prefix}_unquote", unquoted):
+                    add(name, key_bytes)
+
+        b64_text = re.sub(r"\s+", "", text)
+        if re.fullmatch(r"[A-Za-z0-9_\-+/=]{12,}", b64_text):
+            padded = b64_text + ("=" * ((4 - (len(b64_text) % 4)) % 4))
+            for decoder_name, decoder in (("b64", base64.b64decode), ("urlsafe_b64", base64.urlsafe_b64decode)):
+                try:
+                    decoded = decoder(padded)
+                except Exception:
+                    decoded = b""
+                if len(decoded) >= 8:
+                    if self._is_valid_blowfish_key_len(len(decoded)):
+                        add(f"{prefix}_{decoder_name}", decoded)
+                    add(f"{prefix}_{decoder_name}_head8", decoded[:8])
+                    if len(decoded) >= 16:
+                        mid = max(0, (len(decoded) // 2) - 4)
+                        add(f"{prefix}_{decoder_name}_mid8", decoded[mid : mid + 8])
+                    add(f"{prefix}_{decoder_name}_tail8", decoded[-8:])
+
         compact = re.sub(r"[^0-9a-fA-F]", "", text)
         if len(compact) >= 16 and compact.lower() != text.lower():
             compact_bytes = self._hex_to_bytes(compact)
@@ -1376,6 +1406,10 @@ class BbtsVariantRebuilder:
             return b""
 
     @staticmethod
+    def _is_valid_blowfish_key_len(length: int) -> bool:
+        return 4 <= int(length) <= 56
+
+    @staticmethod
     def _load_dispatch_map(dispatch_json_path: Path) -> dict[int, dict[str, object]]:
         raw = json.loads(dispatch_json_path.read_text(encoding="utf-8"))
         root_fields: dict[str, object] = {}
@@ -1398,7 +1432,7 @@ class BbtsVariantRebuilder:
                 continue
             existing = by_segnum.get(segnum)
             if existing is None:
-                by_segnum[segnum] = dict(item)
+                by_segnum[segnum] = BbtsVariantRebuilder._merge_dispatch_entry(dict(item), root_fields)
                 continue
             merged = dict(existing)
             for key in (
@@ -1430,29 +1464,34 @@ class BbtsVariantRebuilder:
                 value = item.get(key)
                 if value not in (None, "", [], {}):
                     merged[key] = value
-            dash_response = root_fields.get("dash_response")
-            if isinstance(dash_response, dict):
-                for key, value in (
-                    ("dash_iv", dash_response.get("iv")),
-                    ("dash_ticket", dash_response.get("ticket")),
-                    ("dash_drm_type", dash_response.get("drm_type")),
-                ):
-                    if key not in merged and value not in (None, "", [], {}):
-                        merged[key] = value
-            moviejson_video = root_fields.get("moviejson_video")
-            if isinstance(moviejson_video, dict):
-                for key, value in (
-                    ("moviejson_iv", moviejson_video.get("iv")),
-                    ("moviejson_eak", moviejson_video.get("eak")),
-                    ("moviejson_ms", moviejson_video.get("ms")),
-                    ("moviejson_ml", moviejson_video.get("ml")),
-                    ("moviejson_ticket", moviejson_video.get("ticket")),
-                    ("moviejson_play_ts_urls", moviejson_video.get("play_ts_urls")),
-                ):
-                    if key not in merged and value not in (None, "", [], {}):
-                        merged[key] = value
-            by_segnum[segnum] = merged
+            by_segnum[segnum] = BbtsVariantRebuilder._merge_dispatch_entry(merged, root_fields)
         return by_segnum
+
+    @staticmethod
+    def _merge_dispatch_entry(entry: dict[str, object], root_fields: dict[str, object]) -> dict[str, object]:
+        merged = dict(entry)
+        dash_response = root_fields.get("dash_response")
+        if isinstance(dash_response, dict):
+            for key, value in (
+                ("dash_iv", dash_response.get("iv")),
+                ("dash_ticket", dash_response.get("ticket")),
+                ("dash_drm_type", dash_response.get("drm_type")),
+            ):
+                if key not in merged and value not in (None, "", [], {}):
+                    merged[key] = value
+        moviejson_video = root_fields.get("moviejson_video")
+        if isinstance(moviejson_video, dict):
+            for key, value in (
+                ("moviejson_iv", moviejson_video.get("iv")),
+                ("moviejson_eak", moviejson_video.get("eak")),
+                ("moviejson_ms", moviejson_video.get("ms")),
+                ("moviejson_ml", moviejson_video.get("ml")),
+                ("moviejson_ticket", moviejson_video.get("ticket")),
+                ("moviejson_play_ts_urls", moviejson_video.get("play_ts_urls")),
+            ):
+                if key not in merged and value not in (None, "", [], {}):
+                    merged[key] = value
+        return merged
 
     @classmethod
     def _probe_gap(cls, probe: ProbeSummary) -> float:
