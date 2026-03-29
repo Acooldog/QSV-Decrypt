@@ -1119,13 +1119,13 @@ class BbtsVariantRebuilder:
                 dispatch_entry.get("dispatch_key_base64"),
                 dispatch_entry.get("dispatch_urls", []) or [],
                 extra_values=[
-                    dispatch_entry.get("dash_iv"),
-                    dispatch_entry.get("dash_ticket"),
-                    dispatch_entry.get("moviejson_iv"),
-                    dispatch_entry.get("moviejson_eak"),
-                    dispatch_entry.get("moviejson_ms"),
-                    dispatch_entry.get("moviejson_ml"),
-                    dispatch_entry.get("moviejson_ticket"),
+                    ("dash_iv", dispatch_entry.get("dash_iv")),
+                    ("dash_ticket", dispatch_entry.get("dash_ticket")),
+                    ("moviejson_iv", dispatch_entry.get("moviejson_iv")),
+                    ("moviejson_eak", dispatch_entry.get("moviejson_eak")),
+                    ("moviejson_ms", dispatch_entry.get("moviejson_ms")),
+                    ("moviejson_ml", dispatch_entry.get("moviejson_ml")),
+                    ("moviejson_ticket", dispatch_entry.get("moviejson_ticket")),
                 ],
             )
         )
@@ -1136,13 +1136,13 @@ class BbtsVariantRebuilder:
                 dispatch_entry.get("cube_dispatch_key_base64"),
                 list(dispatch_entry.get("cube_dispatch_urls", []) or []) + list(dispatch_entry.get("moviejson_play_ts_urls", []) or []),
                 extra_values=[
-                    dispatch_entry.get("dash_iv"),
-                    dispatch_entry.get("dash_ticket"),
-                    dispatch_entry.get("moviejson_iv"),
-                    dispatch_entry.get("moviejson_eak"),
-                    dispatch_entry.get("moviejson_ms"),
-                    dispatch_entry.get("moviejson_ml"),
-                    dispatch_entry.get("moviejson_ticket"),
+                    ("dash_iv", dispatch_entry.get("dash_iv")),
+                    ("dash_ticket", dispatch_entry.get("dash_ticket")),
+                    ("moviejson_iv", dispatch_entry.get("moviejson_iv")),
+                    ("moviejson_eak", dispatch_entry.get("moviejson_eak")),
+                    ("moviejson_ms", dispatch_entry.get("moviejson_ms")),
+                    ("moviejson_ml", dispatch_entry.get("moviejson_ml")),
+                    ("moviejson_ticket", dispatch_entry.get("moviejson_ticket")),
                 ],
             )
         )
@@ -1317,10 +1317,16 @@ class BbtsVariantRebuilder:
                             continue
                         sources.append((source_name, key_bytes))
                         seen.add(identity)
-        for value in extra_values or []:
+        for item in extra_values or []:
+            value_prefix = f"{prefix}_extra"
+            value = item
+            if isinstance(item, tuple) and len(item) == 2:
+                label, value = item
+                label_text = re.sub(r"[^0-9A-Za-z_]+", "_", str(label or "").strip()) or "extra"
+                value_prefix = f"{prefix}_{label_text}"
             if value in (None, ""):
                 continue
-            for source_name, key_bytes in self._collect_text_key_sources(f"{prefix}_extra", str(value)):
+            for source_name, key_bytes in self._collect_text_key_sources(value_prefix, str(value)):
                 identity = (source_name, key_bytes.hex())
                 if identity in seen:
                     continue
