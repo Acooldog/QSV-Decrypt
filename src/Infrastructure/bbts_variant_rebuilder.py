@@ -48,7 +48,7 @@ class BbtsVariantRebuilder:
     PARAMETER_SET_TYPES = {32, 33, 34}
     VCL_TYPES = set(range(0, 32))
     DEFAULT_SHORTLIST_LIMIT = 4
-    DEFAULT_DECODE_HEALTH_LIMIT = 2
+    DEFAULT_DECODE_HEALTH_LIMIT = 3
     DEFAULT_BODY_SKIPS = (2, 5)
     SECOND_PASS_BODY_SKIPS = tuple(range(0, 9))
     SECOND_PASS_STRIP_VARIANTS = (
@@ -525,13 +525,32 @@ class BbtsVariantRebuilder:
             reverse=True,
         )
         for info, path in shortlist[: self.DEFAULT_DECODE_HEALTH_LIMIT]:
-            health = self.ffmpeg_tools.decode_video_health(path)
-            info.decoded_video_sec = float(health.get("decoded_video_sec") or 0.0)
-            info.decode_error_lines = int(health.get("decode_error_lines") or 0.0)
+            health_windows = self._decode_health_windows(info.video_duration_sec)
+            decoded_total = 0.0
+            error_total = 0.0
+            for window_start in health_windows:
+                health = self.ffmpeg_tools.decode_video_window_health(path, window_start)
+                decoded_total += float(health.get("decoded_video_sec") or 0.0)
+                error_total += float(health.get("decode_error_lines") or 0.0)
+            info.decoded_video_sec = round(decoded_total, 6)
+            info.decode_error_lines = int(error_total)
             info.note += (
-                f" Decode health video_sec={info.decoded_video_sec:.3f} "
+                f" Decode health windows={health_windows} "
+                f"video_sec={info.decoded_video_sec:.3f} "
                 f"errors={info.decode_error_lines}."
             )
+
+    @staticmethod
+    def _decode_health_windows(video_duration_sec: float) -> list[float]:
+        if video_duration_sec <= 12.0:
+            return [0.0]
+        if video_duration_sec <= 60.0:
+            return [0.0, max(0.0, video_duration_sec - 10.0)]
+        return [
+            0.0,
+            max(0.0, (video_duration_sec * 0.5) - 4.0),
+            max(0.0, video_duration_sec - 10.0),
+        ]
 
     def _apply_parameter_metrics(
         self,
@@ -664,11 +683,22 @@ class BbtsVariantRebuilder:
 
     @staticmethod
     def _combined_candidate_score(info: BbtsRepairCandidateInfo) -> float:
-        decode_bonus = info.decoded_video_sec * 100.0
-        error_penalty = min(info.decode_error_lines, 50000) * 0.05
+        decode_bonus = info.decoded_video_sec * 180.0
+        decode_penalty_density = 0.0
+        if info.decoded_video_sec > 0.0:
+            decode_penalty_density = (info.decode_error_lines / info.decoded_video_sec) * 6.0
+        error_penalty = min(info.decode_error_lines, 50000) * 0.02
         parameter_bonus = (info.parameter_match_count * 5000.0) + (info.parameter_stability_score * 1500.0)
         parameter_penalty = max(0, info.parameter_unique_total - 3) * 50.0
-        return float(info.score) + float(info.visual_score) + decode_bonus + parameter_bonus - error_penalty - parameter_penalty
+        return (
+            float(info.score)
+            + float(info.visual_score)
+            + decode_bonus
+            + parameter_bonus
+            - error_penalty
+            - decode_penalty_density
+            - parameter_penalty
+        )
 
     @classmethod
     def _extract_parameter_digest_map(cls, payload: bytes) -> dict[int, set[str]]:

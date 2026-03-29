@@ -20,6 +20,8 @@ class FfmpegTools:
     PROBE_TIMEOUT_SEC = 20
     SAMPLE_FRAME_TIMEOUT_SEC = 20
     DECODE_HEALTH_TIMEOUT_SEC = 30
+    WINDOW_DECODE_TIMEOUT_SEC = 15
+    WINDOW_DECODE_DURATION_SEC = 8.0
     REMUX_TIMEOUT_SEC = 60
 
     def __init__(self) -> None:
@@ -190,6 +192,58 @@ class FfmpegTools:
             encoding="utf-8",
             errors="ignore",
             timeout=self.DECODE_HEALTH_TIMEOUT_SEC,
+        )
+        decoded_video_sec = 0.0
+        for line in completed.stdout.splitlines():
+            if not line.startswith("out_time_ms="):
+                continue
+            try:
+                decoded_video_sec = max(decoded_video_sec, int(line.split("=", 1)[1]) / 1_000_000.0)
+            except ValueError:
+                continue
+        error_lines = sum(1 for line in completed.stderr.splitlines() if line.strip())
+        return {
+            "decoded_video_sec": round(decoded_video_sec, 6),
+            "decode_error_lines": float(error_lines),
+        }
+
+    def decode_video_window_health(
+        self,
+        media_path: Path,
+        start_sec: float,
+        duration_sec: float | None = None,
+    ) -> dict[str, float]:
+        self.ensure_available()
+        clip_duration = float(duration_sec or self.WINDOW_DECODE_DURATION_SEC)
+        command = [
+            str(self.ffmpeg_path),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-ss",
+            f"{max(0.0, float(start_sec)):.3f}",
+            "-t",
+            f"{max(0.5, clip_duration):.3f}",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=self.WINDOW_DECODE_TIMEOUT_SEC,
         )
         decoded_video_sec = 0.0
         for line in completed.stdout.splitlines():
