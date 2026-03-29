@@ -17,6 +17,11 @@ logger = logging.getLogger("aqy_decrypt")
 
 
 class FfmpegTools:
+    PROBE_TIMEOUT_SEC = 20
+    SAMPLE_FRAME_TIMEOUT_SEC = 20
+    DECODE_HEALTH_TIMEOUT_SEC = 30
+    REMUX_TIMEOUT_SEC = 60
+
     def __init__(self) -> None:
         assets_dir = get_assets_dir()
         self.ffmpeg_path = assets_dir / "ffmpeg.exe"
@@ -51,6 +56,7 @@ class FfmpegTools:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            timeout=self.PROBE_TIMEOUT_SEC,
         )
         if completed.returncode != 0:
             return ProbeSummary(ok=False, raw={"stderr": completed.stderr.strip()})
@@ -100,7 +106,14 @@ class FfmpegTools:
             command.extend(["-tag:v", "hvc1"])
         command.append(str(output_path))
         started = time.perf_counter()
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, encoding="utf-8")
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=self.REMUX_TIMEOUT_SEC,
+        )
         elapsed_sec = time.perf_counter() - started
         if completed.returncode != 0:
             raise RuntimeError(
@@ -143,6 +156,7 @@ class FfmpegTools:
                 command,
                 check=False,
                 capture_output=True,
+                timeout=self.SAMPLE_FRAME_TIMEOUT_SEC,
             )
             if completed.returncode != 0 or not completed.stdout:
                 continue
@@ -175,6 +189,7 @@ class FfmpegTools:
             text=True,
             encoding="utf-8",
             errors="ignore",
+            timeout=self.DECODE_HEALTH_TIMEOUT_SEC,
         )
         decoded_video_sec = 0.0
         for line in completed.stdout.splitlines():

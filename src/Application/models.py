@@ -461,6 +461,9 @@ class BbtsRepairCandidateInfo:
     dominant_ratio_max: float = 0.0
     decoded_video_sec: float = 0.0
     decode_error_lines: int = 0
+    parameter_match_count: int = 0
+    parameter_stability_score: float = 0.0
+    parameter_unique_total: int = 0
     note: str = ""
 
     def to_dict(self) -> dict[str, Any]:

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .runtime_paths import get_default_localwebapp_cache_root
+
 logger = logging.getLogger("aqy_decrypt")
 
 
@@ -25,6 +27,11 @@ class SegmentManifestBuilder:
         scheduler_events = list(cube_summary.get("scheduler_events") or [])
         set_params = list(cube_summary.get("set_params") or [])
         interrupt_events = list(cube_summary.get("interrupt_events") or [])
+        movie_payload = self._find_matching_movie_payload(metadata_entry)
+        selected_movie_video = self._select_movie_video(
+            movie_payload,
+            preferred_video_id=str(getattr(metadata_entry, "video_id", "") or ""),
+        )
 
         dash_url = ""
         dash_response: dict[str, Any] | None = None
@@ -50,6 +57,8 @@ class SegmentManifestBuilder:
             segnum = item.get("segnum")
             if isinstance(segnum, int):
                 merged_by_segnum[segnum] = dict(item)
+
+        shared_segment_fields = self._build_shared_segment_fields(dash_response, selected_movie_video)
 
         for event in scheduler_events:
             if not isinstance(event, dict):
@@ -94,6 +103,9 @@ class SegmentManifestBuilder:
                 merged["audio_amp4_total_bytes"] = int(audio_group["total_bytes"])
                 merged["audio_amp4_entry_count"] = int(audio_group["entry_count"])
                 break
+            for key, value in shared_segment_fields.items():
+                if key not in merged and value not in (None, "", [], {}):
+                    merged[key] = value
 
         tasks = [merged_by_segnum[index] for index in sorted(merged_by_segnum)]
         manifest: dict[str, Any] = {
@@ -118,10 +130,145 @@ class SegmentManifestBuilder:
                 "unencrypted_duration": self._nested_get(dash_response, "data", "program", "video", 0, "unencryptedDuration"),
                 "duration": self._nested_get(dash_response, "data", "program", "video", 0, "duration"),
             }
+        if selected_movie_video is not None:
+            manifest["moviejson_video"] = {
+                "bid": selected_movie_video.get("bid"),
+                "vid": selected_movie_video.get("vid"),
+                "ff": selected_movie_video.get("ff"),
+                "drm_type": selected_movie_video.get("drmType"),
+                "iv": selected_movie_video.get("iv"),
+                "eak": selected_movie_video.get("eak"),
+                "ms": selected_movie_video.get("ms"),
+                "ml": selected_movie_video.get("ml"),
+                "ticket": self._nested_get(selected_movie_video, "drm", "ticket"),
+                "play_ts_urls": self._extract_play_ts_urls(selected_movie_video),
+            }
 
         manifest_path = work_dir / "bbts_segment_manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest, manifest_path
+
+    def _find_matching_movie_payload(self, metadata_entry) -> dict[str, Any] | None:
+        if metadata_entry is None:
+            return None
+        cache_root = get_default_localwebapp_cache_root()
+        if not cache_root.exists():
+            return None
+        tvid = str(getattr(metadata_entry, "tvid", "") or "")
+        video_id = str(getattr(metadata_entry, "video_id", "") or "")
+        aid = str(getattr(metadata_entry, "aid", "") or "")
+        display_name = str(getattr(metadata_entry, "display_name", "") or getattr(metadata_entry, "save_file_name", "") or "")
+        best_payload: dict[str, Any] | None = None
+        best_score = -1
+        for path in sorted(cache_root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:80]:
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if tvid and tvid not in text:
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception:
+                continue
+            movie_json_text = payload.get("video_data_flow", {}).get("movieJSON") if isinstance(payload, dict) else None
+            if not isinstance(movie_json_text, str):
+                continue
+            try:
+                movie_payload = json.loads(movie_json_text)
+            except Exception:
+                continue
+            top_tvid = str(movie_payload.get("data", {}).get("tvid") or "")
+            if tvid and top_tvid and top_tvid != tvid:
+                continue
+            score = 0
+            if video_id and video_id in text:
+                score += 3
+            if aid and aid in text:
+                score += 2
+            if display_name and display_name.split("-")[0] in text:
+                score += 1
+            if movie_payload.get("data", {}).get("program", {}).get("video"):
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_payload = movie_payload
+        return best_payload
+
+    @staticmethod
+    def _select_movie_video(movie_payload: dict[str, Any] | None, preferred_video_id: str = "") -> dict[str, Any] | None:
+        if not isinstance(movie_payload, dict):
+            return None
+        video_list = movie_payload.get("data", {}).get("program", {}).get("video")
+        if not isinstance(video_list, list):
+            return None
+        if preferred_video_id:
+            exact = next(
+                (
+                    item
+                    for item in video_list
+                    if isinstance(item, dict) and str(item.get("vid") or "") == preferred_video_id and str(item.get("ff") or "") == "ts"
+                ),
+                None,
+            )
+            if isinstance(exact, dict):
+                return exact
+        selected = next(
+            (
+                item
+                for item in video_list
+                if isinstance(item, dict) and item.get("_selected") and str(item.get("ff") or "") == "ts"
+            ),
+            None,
+        )
+        if isinstance(selected, dict):
+            return selected
+        ts_candidates = [item for item in video_list if isinstance(item, dict) and str(item.get("ff") or "") == "ts"]
+        if not ts_candidates:
+            return None
+        ts_candidates.sort(key=lambda item: (int(item.get("bid") or 0), int(item.get("vsize") or 0)), reverse=True)
+        return ts_candidates[0]
+
+    def _build_shared_segment_fields(
+        self,
+        dash_response: dict[str, Any] | None,
+        selected_movie_video: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if isinstance(dash_response, dict):
+            fields.update(
+                {
+                    "dash_iv": self._nested_get(dash_response, "data", "program", "video", 0, "iv"),
+                    "dash_ticket": self._nested_get(dash_response, "data", "program", "video", 0, "drm", "ticket"),
+                    "dash_drm_type": self._nested_get(dash_response, "data", "program", "video", 0, "drmType"),
+                }
+            )
+        if isinstance(selected_movie_video, dict):
+            fields.update(
+                {
+                    "moviejson_iv": selected_movie_video.get("iv"),
+                    "moviejson_eak": selected_movie_video.get("eak"),
+                    "moviejson_ms": selected_movie_video.get("ms"),
+                    "moviejson_ml": selected_movie_video.get("ml"),
+                    "moviejson_ticket": self._nested_get(selected_movie_video, "drm", "ticket"),
+                    "moviejson_play_ts_urls": self._extract_play_ts_urls(selected_movie_video),
+                }
+            )
+        return fields
+
+    @staticmethod
+    def _extract_play_ts_urls(selected_movie_video: dict[str, Any]) -> list[str]:
+        items = SegmentManifestBuilder._nested_get(selected_movie_video, "play", "ts", "d")
+        if not isinstance(items, list):
+            return []
+        urls: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("URL")
+            if isinstance(url, str) and url and url not in urls:
+                urls.append(url)
+        return urls
 
     def _fetch_dash_response(self, dash_url: str) -> dict[str, Any] | None:
         try:
