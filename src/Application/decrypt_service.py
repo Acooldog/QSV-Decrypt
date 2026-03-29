@@ -5,6 +5,8 @@ import json
 import logging
 import shutil
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,6 +27,8 @@ from src.Infrastructure.db_snapshot import DbSnapshotService
 from src.Infrastructure.ffmpeg_tools import FfmpegTools
 from src.Infrastructure.qsv_offline import QsvOfflineDecoder
 from src.Infrastructure.runtime_paths import get_log_day_dir
+from src.Infrastructure.segment_manifest import SegmentManifestBuilder
+from src.Infrastructure.live_hls_rebuilder import LiveHlsRebuilder
 
 
 logger = logging.getLogger("aqy_decrypt")
@@ -40,6 +44,8 @@ class DecryptService:
         db_prototype_rebuilder: DbPrototypeRebuilder | None = None,
         db_open_sample_prototype: DbOpenSamplePrototype | None = None,
         bbts_variant_rebuilder: BbtsVariantRebuilder | None = None,
+        segment_manifest_builder: SegmentManifestBuilder | None = None,
+        live_hls_rebuilder: LiveHlsRebuilder | None = None,
     ) -> None:
         self.decoder = decoder
         self.ffmpeg_tools = ffmpeg_tools
@@ -55,6 +61,10 @@ class DecryptService:
             decoder=self.decoder,
         )
         self.bbts_variant_rebuilder = bbts_variant_rebuilder or BbtsVariantRebuilder(
+            ffmpeg_tools=self.ffmpeg_tools,
+        )
+        self.segment_manifest_builder = segment_manifest_builder or SegmentManifestBuilder()
+        self.live_hls_rebuilder = live_hls_rebuilder or LiveHlsRebuilder(
             ffmpeg_tools=self.ffmpeg_tools,
         )
 
@@ -154,6 +164,50 @@ class DecryptService:
             output_root=output_root,
         )
         return {
+            "prototype_plan": plan.to_dict(),
+        }
+
+    def prototype_live_hls_rebuild(
+        self,
+        sample_path: Path,
+        *,
+        max_duration_sec: float | None = None,
+        max_segments: int | None = None,
+        max_run_sec: float = 50.0,
+        workers: int = 8,
+        output_root: Path | None = None,
+        frame_check_points: list[float] | None = None,
+    ) -> dict:
+        inspection = self.decoder.inspect(sample_path)
+        inspection = self._ensure_db_correlation(sample_path, inspection)
+        metadata_entry = None
+        dash_url = ""
+        if inspection.db_correlation and inspection.db_correlation.download_metadata:
+            entries = inspection.db_correlation.download_metadata.matched_entries
+            metadata_entry = entries[0] if entries else None
+        cube_summary = dict(getattr(getattr(inspection, "db_correlation", None), "cube_log_summary", {}) or {})
+        for event in list(cube_summary.get("set_params") or []):
+            if isinstance(event, dict) and event.get("event_type") == "vps_param" and isinstance(event.get("url"), str):
+                dash_url = event["url"]
+                break
+        if not dash_url:
+            for event in list(cube_summary.get("interrupt_events") or []):
+                if isinstance(event, dict) and isinstance(event.get("url"), str) and "cache.video.iqiyi.com/dash" in event["url"]:
+                    dash_url = event["url"]
+                    break
+        plan = self.live_hls_rebuilder.rebuild(
+            sample_path=sample_path,
+            metadata_entry=metadata_entry,
+            output_root=output_root,
+            dash_url=dash_url or None,
+            max_duration_sec=max_duration_sec,
+            max_segments=max_segments,
+            max_run_sec=max_run_sec,
+            workers=workers,
+            frame_check_points=frame_check_points,
+        )
+        return {
+            "inspection": inspection.to_dict(),
             "prototype_plan": plan.to_dict(),
         }
 
@@ -422,6 +476,9 @@ class DecryptService:
         bbts_root = get_log_day_dir() / "bbts_repair"
         existing = self._load_existing_bbts_success(qsv_path, bbts_root)
         plan = existing
+        if plan is not None and not self._is_confident_bbts_plan(plan):
+            logger.info("%s: ignoring stale/untrusted bbts repair cache; rebuilding.", qsv_path.name)
+            plan = None
         if plan is None:
             segments_dir, dispatch_json_path = self._materialize_bbts_inputs(
                 qsv_path=qsv_path,
@@ -517,8 +574,8 @@ class DecryptService:
             logger.warning("%s: failed to enrich db_correlation for bbts repair: %s", qsv_path.name, exc)
         return inspection
 
-    @staticmethod
     def _materialize_bbts_inputs(
+        self,
         qsv_path: Path,
         inspection,
         work_dir: Path,
@@ -526,17 +583,234 @@ class DecryptService:
         segments_dir = work_dir / "bbts_segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
         qsv_bytes = qsv_path.read_bytes()
+        correlation = inspection.db_correlation
+        manifest, manifest_path = DecryptService._build_segment_manifest(
+            qsv_path=qsv_path,
+            inspection=inspection,
+            work_dir=work_dir,
+            builder=self.segment_manifest_builder,
+        )
+        tasks = list(manifest.get("segments") or [])
+        task_by_segnum = {
+            int(item["segnum"]): item
+            for item in tasks
+            if isinstance(item, dict) and isinstance(item.get("segnum"), int)
+        }
         for index, run in enumerate(inspection.stable_runs):
             start = int(run.offset)
-            end = start + int(run.length)
-            (segments_dir / f"{index:02d}.ts").write_bytes(qsv_bytes[start:end])
+            length = int(run.length)
+            end = start + length
+            task = task_by_segnum.get(index, {})
+            target_path = segments_dir / f"{index:02d}.ts"
+            remote_ok = False
+            remote_source = ""
+            group_urls: list[str] = []
+            if isinstance(task, dict):
+                group_urls = [item for item in list(task.get("m3u8_group_urls") or []) if isinstance(item, str)]
+                logger.info("%s: materialize seg=%s via remote dispatch primary", qsv_path.name, index)
+                remote_ok = DecryptService._download_remote_segment_to_path(
+                    urls=[
+                        *list(task.get("dispatch_urls") or []),
+                        *list(task.get("cube_dispatch_urls") or []),
+                    ],
+                    expected_size=int(task.get("f4vsize") or 0),
+                    target_path=target_path,
+                )
+                if remote_ok:
+                    remote_source = "remote_dispatch"
+                if not remote_ok and group_urls:
+                    logger.info("%s: materialize seg=%s via remote m3u8 group fallback (%s urls)", qsv_path.name, index, len(group_urls))
+                    remote_ok = DecryptService._download_remote_fragment_group_to_path(
+                        urls=group_urls,
+                        expected_size=int(task.get("m3u8_group_total_bytes") or task.get("f4vsize") or 0),
+                        target_path=target_path,
+                    )
+                    if remote_ok:
+                        remote_source = "remote_m3u8_group"
+            if remote_ok:
+                logger.info("%s: materialize seg=%s complete source=%s bytes=%s", qsv_path.name, index, remote_source or "remote_dispatch", target_path.stat().st_size)
+                if isinstance(task, dict):
+                    task["materialized_source"] = remote_source or "remote_dispatch"
+                    task["materialized_bytes"] = target_path.stat().st_size
+                continue
 
-        dispatch_json_path = work_dir / "bbts_dispatch_hits.json"
-        correlation = inspection.db_correlation
-        tasks = list(getattr(correlation, "qtplog_segment_tasks", []) or [])
-        tasks.sort(key=lambda item: (int(item.get("segnum", -1)) if isinstance(item.get("segnum"), int) else -1, str(item.get("log_path", "")), int(item.get("line_no", 0))))
-        dispatch_json_path.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
-        return segments_dir, dispatch_json_path
+            target_size = int(task.get("f4vsize") or 0) if isinstance(task, dict) else 0
+            if target_size > length:
+                delta = target_size - length
+                candidate_start = max(0, start - delta)
+                candidate_end = candidate_start + target_size
+                if candidate_end <= len(qsv_bytes):
+                    start = candidate_start
+                    end = candidate_end
+            target_path.write_bytes(qsv_bytes[start:end])
+            logger.info("%s: materialize seg=%s fell back to qsv_slice bytes=%s", qsv_path.name, index, end - start)
+            if isinstance(task, dict):
+                task["materialized_source"] = "qsv_slice"
+                task["materialized_bytes"] = end - start
+
+        merged_manifest = dict(manifest)
+        merged_manifest["segments"] = tasks
+        manifest_path.write_text(json.dumps(merged_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return segments_dir, manifest_path
+
+    @staticmethod
+    def _build_segment_manifest(
+        qsv_path: Path,
+        inspection,
+        work_dir: Path,
+        builder: SegmentManifestBuilder,
+    ) -> tuple[dict[str, object], Path]:
+        return builder.build(
+            sample_path=qsv_path,
+            inspection=inspection,
+            work_dir=work_dir,
+        )
+
+    @staticmethod
+    def _download_remote_segment_to_path(urls: list[object], expected_size: int, target_path: Path) -> bool:
+        if DecryptService._path_has_expected_size(target_path, expected_size):
+            return True
+        part_path = target_path.with_suffix(target_path.suffix + ".part")
+        for url in urls:
+            if not isinstance(url, str) or not url:
+                continue
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept-Encoding": "identity",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=20) as response, open(part_path, "wb") as handle:
+                    shutil.copyfileobj(response, handle, length=1024 * 1024)
+            except Exception:
+                continue
+            if not part_path.exists():
+                continue
+            payload_size = part_path.stat().st_size
+            if payload_size <= 0:
+                continue
+            if expected_size > 0 and payload_size != expected_size:
+                continue
+            payload = part_path.read_bytes()
+            shutil.move(str(part_path), str(target_path))
+            return True
+        if part_path.exists():
+            part_path.unlink(missing_ok=True)
+        return False
+
+    @staticmethod
+    def _download_remote_fragment_group_to_path(
+        urls: list[str],
+        expected_size: int,
+        target_path: Path,
+    ) -> bool:
+        if DecryptService._path_has_expected_size(target_path, expected_size):
+            return True
+        part_path = target_path.with_suffix(target_path.suffix + ".part")
+        chunk_sizes = [DecryptService._extract_query_int(url, "contentlength") for url in urls]
+        start_index = 0
+        if part_path.exists():
+            existing_size = part_path.stat().st_size
+            if expected_size > 0 and existing_size == expected_size:
+                shutil.move(str(part_path), str(target_path))
+                return True
+            boundary = 0
+            matched = False
+            for index, size in enumerate(chunk_sizes):
+                boundary += size
+                if existing_size == boundary:
+                    start_index = index + 1
+                    matched = True
+                    break
+                if existing_size < boundary:
+                    break
+            if not matched and existing_size > 0:
+                part_path.unlink(missing_ok=True)
+                start_index = 0
+        mode = "ab" if part_path.exists() and start_index > 0 else "wb"
+        with open(part_path, mode) as handle:
+            for url in urls[start_index:]:
+                expected_chunk_size = DecryptService._extract_query_int(url, "contentlength")
+                before = handle.tell()
+                try:
+                    request = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Accept-Encoding": "identity",
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=20) as response:
+                        shutil.copyfileobj(response, handle, length=1024 * 1024)
+                except Exception:
+                    return False
+                written = handle.tell() - before
+                if written <= 0:
+                    return False
+                if expected_chunk_size > 0 and written != expected_chunk_size:
+                    return False
+        total = part_path.stat().st_size if part_path.exists() else 0
+        if expected_size > 0 and total != expected_size:
+            return False
+        shutil.move(str(part_path), str(target_path))
+        return True
+
+    @staticmethod
+    def _path_has_expected_size(path: Path, expected_size: int) -> bool:
+        if not path.exists():
+            return False
+        if expected_size <= 0:
+            return path.stat().st_size > 0
+        return path.stat().st_size == expected_size
+
+    @staticmethod
+    def _extract_query_int(url: str, key: str) -> int:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            values = urllib.parse.parse_qs(parsed.query).get(key)
+            if values:
+                return int(values[0])
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
+    def _download_remote_fragment_group(urls: list[str], expected_size: int) -> bytes:
+        payload_parts: list[bytes] = []
+        total = 0
+        for url in urls:
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept-Encoding": "identity",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    chunk = response.read()
+            except Exception:
+                return b""
+            if not chunk:
+                return b""
+            payload_parts.append(chunk)
+            total += len(chunk)
+        if expected_size > 0 and total != expected_size:
+            return b""
+        return b"".join(payload_parts)
+
+    @staticmethod
+    def _looks_like_transport_stream(payload: bytes) -> bool:
+        if len(payload) < 188 * 4 or payload[0] != 0x47:
+            return False
+        sample_count = min(len(payload) // 188, 32)
+        sync_hits = 0
+        for index in range(sample_count):
+            if payload[index * 188] == 0x47:
+                sync_hits += 1
+        return sync_hits >= max(4, sample_count - 1)
 
     @staticmethod
     def _load_existing_bbts_success(qsv_path: Path, bbts_root: Path):

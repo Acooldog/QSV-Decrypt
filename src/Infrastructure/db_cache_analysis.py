@@ -5,8 +5,18 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
-from src.Application.models import DbCorrelation, DbSnapshot, QsvInspection, WalFrame, WalInspection, WalOpaquePage
+from src.Application.models import (
+    DbCorrelation,
+    DbSnapshot,
+    DownloadMetadataCorrelation,
+    QsvInspection,
+    WalFrame,
+    WalInspection,
+    WalOpaquePage,
+)
 
+from .cube_log_analysis import CubeLogAnalyzer
+from .download_metadata_analysis import DownloadMetadataAnalyzer
 from .qtplog_analysis import QtpLogAnalyzer
 from .runtime_paths import get_default_cache_root
 
@@ -31,9 +41,17 @@ class DbCacheAnalyzer:
         "vid": b"vid",
     }
 
-    def __init__(self, cache_root: Path | None = None, qtplog_analyzer: QtpLogAnalyzer | None = None) -> None:
+    def __init__(
+        self,
+        cache_root: Path | None = None,
+        qtplog_analyzer: QtpLogAnalyzer | None = None,
+        download_metadata_analyzer: DownloadMetadataAnalyzer | None = None,
+        cube_log_analyzer: CubeLogAnalyzer | None = None,
+    ) -> None:
         self.cache_root = cache_root or get_default_cache_root()
         self.qtplog_analyzer = qtplog_analyzer or QtpLogAnalyzer()
+        self.download_metadata_analyzer = download_metadata_analyzer or DownloadMetadataAnalyzer()
+        self.cube_log_analyzer = cube_log_analyzer or CubeLogAnalyzer()
 
     def inspect_snapshot(
         self,
@@ -41,7 +59,8 @@ class DbCacheAnalyzer:
         sample_path: Path,
         qsv_inspection: QsvInspection | None = None,
     ) -> DbCorrelation:
-        needle_specs = self._build_needles(sample_path, qsv_inspection)
+        download_metadata = self.download_metadata_analyzer.inspect_sample(sample_path)
+        needle_specs = self._build_needles(sample_path, qsv_inspection, download_metadata)
         wal_inspections: list[WalInspection] = []
         identifier_candidates: list[str] = []
         candidate_cache_paths: list[str] = []
@@ -145,9 +164,21 @@ class DbCacheAnalyzer:
                     "Stable TS gaps detected at fixed lengths: "
                     + ", ".join(str(length) for length in unique_gap_lengths)
                 )
+        notes.extend(download_metadata.notes)
+        metadata_entry = download_metadata.matched_entries[0] if download_metadata.matched_entries else None
+        if metadata_entry:
+            identifier_candidates.extend(
+                [
+                    metadata_entry.tvid,
+                    metadata_entry.video_id,
+                    metadata_entry.aid,
+                ]
+            )
 
         qtplog_summary = self.qtplog_analyzer.inspect_sample(sample_path)
+        cube_log_summary = self.cube_log_analyzer.inspect_sample(sample_path, download_metadata)
         notes.extend(qtplog_summary["notes"])
+        notes.extend(cube_log_summary["notes"])
         qtplog_alignment = self._build_qtplog_alignment(
             qtplog_summary["segment_tasks"],
             qsv_inspection,
@@ -176,6 +207,16 @@ class DbCacheAnalyzer:
                     "Later qsvd segments are .bbts, not plain .ts; this matches public reports that IQIYI only "
                     "stores the leading segment as plain TS and wraps later segments in BBTS/protected transport."
                 )
+            if metadata_entry:
+                task_tvids = {str(item.get("tvid") or "") for item in qtplog_summary["segment_tasks"]}
+                task_vids = {str(item.get("vid") or "") for item in qtplog_summary["segment_tasks"]}
+                task_cids = {str(item.get("cid") or "") for item in qtplog_summary["segment_tasks"]}
+                if metadata_entry.tvid and metadata_entry.tvid in task_tvids:
+                    notes.append("Downloaded.xml TVID matches qtplog qsvd tasks exactly.")
+                if metadata_entry.video_id and metadata_entry.video_id in task_vids:
+                    notes.append("Downloaded.xml VideoId matches qtplog qsvd tasks exactly.")
+                if metadata_entry.aid and metadata_entry.aid in task_cids:
+                    notes.append("Downloaded.xml aid matches qtplog cid exactly; treat aid as the per-sample media/audio id.")
             dispatch_key_segnums = qtplog_alignment.get("dispatch_key_segnums", [])
             if dispatch_key_segnums:
                 notes.append(
@@ -210,6 +251,8 @@ class DbCacheAnalyzer:
             qtplog_path_events=qtplog_summary["path_events"],
             qtplog_dispatch_events=qtplog_summary.get("dispatch_events", []),
             qtplog_segment_alignment=qtplog_alignment,
+            download_metadata=download_metadata,
+            cube_log_summary=cube_log_summary,
             notes=notes,
         )
 
@@ -434,6 +477,7 @@ class DbCacheAnalyzer:
     def _build_needles(
         sample_path: Path,
         qsv_inspection: QsvInspection | None,
+        download_metadata: DownloadMetadataCorrelation | None = None,
     ) -> list[tuple[str, bytes]]:
         terms = {
             "sample_name": sample_path.name,
@@ -443,6 +487,23 @@ class DbCacheAnalyzer:
         if qsv_inspection:
             terms["file_size"] = str(qsv_inspection.file_size)
             terms["payload_offset"] = str(qsv_inspection.payload_offset or 0)
+        if download_metadata and download_metadata.matched_entries:
+            entry = download_metadata.matched_entries[0]
+            terms.update(
+                {
+                    "tvid": entry.tvid,
+                    "video_id": entry.video_id,
+                    "aid": entry.aid,
+                    "lid": entry.lid,
+                    "cf": entry.cf,
+                    "ct": entry.ct,
+                    "download_save_dir": entry.save_dir,
+                    "download_save_file_name": entry.save_file_name,
+                    "duration": entry.duration,
+                    "bitrate": entry.bitrate,
+                    "file_size_declared": entry.file_size,
+                }
+            )
         needle_specs: list[tuple[str, bytes]] = []
         for label, value in terms.items():
             if not value:

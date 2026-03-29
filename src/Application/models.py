@@ -202,6 +202,78 @@ class SnapshotWalDiff:
 
 
 @dataclass
+class DownloadMetadataEntry:
+    save_dir: str
+    save_file_name: str
+    save_path: str
+    display_name: str = ""
+    album_name: str = ""
+    channel_name: str = ""
+    tvid: str = ""
+    video_id: str = ""
+    aid: str = ""
+    lid: str = ""
+    cf: str = ""
+    ct: str = ""
+    bitrate: str = ""
+    duration: str = ""
+    file_size: str = ""
+    audio_type_name: str = ""
+    pay_mark: str = ""
+    album_source_type: str = ""
+    cert_present: bool = False
+    cert_sha1: str = ""
+    raw_attrs: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "save_dir": self.save_dir,
+            "save_file_name": self.save_file_name,
+            "save_path": self.save_path,
+            "display_name": self.display_name,
+            "album_name": self.album_name,
+            "channel_name": self.channel_name,
+            "tvid": self.tvid,
+            "video_id": self.video_id,
+            "aid": self.aid,
+            "lid": self.lid,
+            "cf": self.cf,
+            "ct": self.ct,
+            "bitrate": self.bitrate,
+            "duration": self.duration,
+            "file_size": self.file_size,
+            "audio_type_name": self.audio_type_name,
+            "pay_mark": self.pay_mark,
+            "album_source_type": self.album_source_type,
+            "cert_present": self.cert_present,
+            "cert_sha1": self.cert_sha1,
+            "raw_attrs": dict(self.raw_attrs),
+        }
+
+
+@dataclass
+class DownloadMetadataCorrelation:
+    db_path: Path
+    downloaded_xml_row_size: int = 0
+    matched_entries: list[DownloadMetadataEntry] = field(default_factory=list)
+    total_entry_count: int = 0
+    cert_entry_count: int = 0
+    unique_cert_sha1s: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "db_path": str(self.db_path),
+            "downloaded_xml_row_size": self.downloaded_xml_row_size,
+            "matched_entries": [item.to_dict() for item in self.matched_entries],
+            "total_entry_count": self.total_entry_count,
+            "cert_entry_count": self.cert_entry_count,
+            "unique_cert_sha1s": list(self.unique_cert_sha1s),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
 class DbCorrelation:
     sample_path: Path
     snapshot_mode: str
@@ -213,6 +285,8 @@ class DbCorrelation:
     qtplog_path_events: list[dict[str, Any]] = field(default_factory=list)
     qtplog_dispatch_events: list[dict[str, Any]] = field(default_factory=list)
     qtplog_segment_alignment: dict[str, Any] = field(default_factory=dict)
+    download_metadata: DownloadMetadataCorrelation | None = None
+    cube_log_summary: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -227,6 +301,8 @@ class DbCorrelation:
             "qtplog_path_events": list(self.qtplog_path_events),
             "qtplog_dispatch_events": list(self.qtplog_dispatch_events),
             "qtplog_segment_alignment": dict(self.qtplog_segment_alignment),
+            "download_metadata": self.download_metadata.to_dict() if self.download_metadata else None,
+            "cube_log_summary": dict(self.cube_log_summary),
             "notes": list(self.notes),
         }
         
@@ -438,6 +514,62 @@ class BbtsRepairPlan:
             "output_ts_path": str(self.output_ts_path) if self.output_ts_path else None,
             "output_mp4_path": str(self.output_mp4_path) if self.output_mp4_path else None,
             "final_probe_summary": asdict(self.final_probe_summary) if self.final_probe_summary else None,
+            "artifact_paths": [str(path) for path in self.artifact_paths],
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
+class LiveHlsFrameCheck:
+    timestamp_sec: float
+    png_path: Path | None = None
+    gray_stats: list[dict[str, float]] = field(default_factory=list)
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp_sec": self.timestamp_sec,
+            "png_path": str(self.png_path) if self.png_path else None,
+            "gray_stats": [dict(item) for item in self.gray_stats],
+            "note": self.note,
+        }
+
+
+@dataclass
+class LiveHlsRebuildPlan:
+    sample_path: Path
+    status: str
+    playlist_url: str = ""
+    selected_bid: int = 0
+    selected_vid: str = ""
+    total_segments: int = 0
+    downloaded_segments: int = 0
+    target_duration_sec: float = 0.0
+    downloaded_duration_sec: float = 0.0
+    output_ts_path: Path | None = None
+    output_mp4_path: Path | None = None
+    probe_summary: ProbeSummary | None = None
+    decode_health: dict[str, float] = field(default_factory=dict)
+    frame_checks: list[LiveHlsFrameCheck] = field(default_factory=list)
+    artifact_paths: list[Path] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sample_path": str(self.sample_path),
+            "status": self.status,
+            "playlist_url": self.playlist_url,
+            "selected_bid": self.selected_bid,
+            "selected_vid": self.selected_vid,
+            "total_segments": self.total_segments,
+            "downloaded_segments": self.downloaded_segments,
+            "target_duration_sec": self.target_duration_sec,
+            "downloaded_duration_sec": self.downloaded_duration_sec,
+            "output_ts_path": str(self.output_ts_path) if self.output_ts_path else None,
+            "output_mp4_path": str(self.output_mp4_path) if self.output_mp4_path else None,
+            "probe_summary": asdict(self.probe_summary) if self.probe_summary else None,
+            "decode_health": dict(self.decode_health),
+            "frame_checks": [item.to_dict() for item in self.frame_checks],
             "artifact_paths": [str(path) for path in self.artifact_paths],
             "notes": list(self.notes),
         }

@@ -94,6 +94,17 @@ class DbPrototypeRebuilder:
             notes.append(
                 f"Database/WAL candidate identifiers found: {len(db_correlation.identifier_candidates)}"
             )
+        if db_correlation.download_metadata and db_correlation.download_metadata.matched_entries:
+            metadata = db_correlation.download_metadata.matched_entries[0]
+            notes.append(
+                "Downloaded.xml maps this sample to TVID/VideoId/aid/lid/cf/ct = "
+                f"{metadata.tvid}/{metadata.video_id}/{metadata.aid}/{metadata.lid}/{metadata.cf}/{metadata.ct}."
+            )
+            if metadata.cert_present:
+                notes.append(
+                    "Downloaded.xml also carries the same global DRM cert blob seen in other protected rows; the "
+                    "remaining missing artifact is still the sample-specific mapping/license result, not the cert itself."
+                )
         if db_correlation.qtplog_segment_tasks:
             segnums = sorted(
                 {

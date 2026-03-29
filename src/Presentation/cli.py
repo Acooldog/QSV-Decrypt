@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 from src.Application.decrypt_service import DecryptService
@@ -14,6 +15,7 @@ from src.Infrastructure.db_prototype_rebuilder import DbPrototypeRebuilder
 from src.Infrastructure.db_snapshot import DbSnapshotService
 from src.Infrastructure.ffmpeg_tools import FfmpegTools
 from src.Infrastructure.hook_capture import HookCapture
+from src.Infrastructure.live_hls_rebuilder import LiveHlsRebuilder
 from src.Infrastructure.local_cache_index import LocalCacheIndex
 from src.Infrastructure.logging_utils import setup_logging
 from src.Infrastructure.qsv_offline import QsvOfflineDecoder
@@ -23,8 +25,24 @@ from src.Infrastructure.runtime_paths import (
     get_default_output_root,
     get_runtime_dir,
 )
+from src.Infrastructure.segment_manifest import SegmentManifestBuilder
 
 logger = logging.getLogger("aqy_decrypt")
+
+
+def print_json(payload: object) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        print(text)
+        return
+    except UnicodeEncodeError:
+        pass
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(text.encode("utf-8", errors="replace"))
+        buffer.write(b"\n")
+        return
+    print(text.encode("ascii", errors="backslashreplace").decode("ascii"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +102,22 @@ def build_parser() -> argparse.ArgumentParser:
     prototype_bbts.add_argument("--segments-dir", required=True, help="Directory containing split TS segments")
     prototype_bbts.add_argument("--dispatch-json", required=True, help="Dispatch hit JSON with per-segment keys")
     prototype_bbts.add_argument("--output-root", default="", help="Optional prototype output directory")
+
+    prototype_live_hls = subparsers.add_parser(
+        "prototype-live-hls-rebuild",
+        help="Rebuild one sample from local live HLS playlist cache in playlist order",
+    )
+    prototype_live_hls.add_argument("--sample", required=True, help="Path to the qsv sample")
+    prototype_live_hls.add_argument("--max-duration-sec", type=float, default=0.0, help="Optional bounded playlist duration")
+    prototype_live_hls.add_argument("--max-segments", type=int, default=0, help="Optional bounded segment count")
+    prototype_live_hls.add_argument("--max-run-sec", type=float, default=50.0, help="Download budget for one invocation")
+    prototype_live_hls.add_argument("--workers", type=int, default=8, help="Parallel download workers")
+    prototype_live_hls.add_argument("--output-root", default="", help="Optional prototype output directory")
+    prototype_live_hls.add_argument(
+        "--frame-checks",
+        default="390,420",
+        help="Comma-separated frame check timestamps in seconds",
+    )
 
     compare_snapshots = subparsers.add_parser(
         "compare-db-snapshots",
@@ -146,6 +180,8 @@ def create_service() -> DecryptService:
         cache_root=cache_root,
     )
     bbts_variant_rebuilder = BbtsVariantRebuilder(ffmpeg_tools=ffmpeg_tools)
+    segment_manifest_builder = SegmentManifestBuilder()
+    live_hls_rebuilder = LiveHlsRebuilder(ffmpeg_tools=ffmpeg_tools)
     return DecryptService(
         decoder=decoder,
         ffmpeg_tools=ffmpeg_tools,
@@ -154,6 +190,8 @@ def create_service() -> DecryptService:
         db_prototype_rebuilder=db_prototype_rebuilder,
         db_open_sample_prototype=db_open_sample_prototype,
         bbts_variant_rebuilder=bbts_variant_rebuilder,
+        segment_manifest_builder=segment_manifest_builder,
+        live_hls_rebuilder=live_hls_rebuilder,
     )
 
 
@@ -242,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "inspect":
         payload = service.inspect(Path(args.sample))
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "inspect-db":
@@ -250,12 +288,12 @@ def main(argv: list[str] | None = None) -> int:
             sample_path=Path(args.sample),
             snapshot_mode=args.snapshot_mode,
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "snapshot-db":
         payload = service.snapshot_db(mode=args.mode)
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "prototype-db-rebuild":
@@ -265,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_mode=args.snapshot_mode,
             output_root=output_root,
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "prototype-open-diff":
@@ -275,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
             wait_sec=args.wait_sec,
             client_path=client_path,
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "prototype-bbts-rebuild":
@@ -286,8 +324,28 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_json_path=Path(args.dispatch_json),
             output_root=output_root,
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
+
+    if args.command == "prototype-live-hls-rebuild":
+        output_root = Path(args.output_root) if args.output_root else None
+        frame_check_points = [
+            float(item)
+            for item in str(args.frame_checks or "").split(",")
+            if item.strip()
+        ]
+        payload = service.prototype_live_hls_rebuild(
+            sample_path=Path(args.sample),
+            max_duration_sec=(args.max_duration_sec or None),
+            max_segments=(args.max_segments or None),
+            max_run_sec=float(args.max_run_sec),
+            workers=int(args.workers),
+            output_root=output_root,
+            frame_check_points=frame_check_points,
+        )
+        print_json(payload)
+        plan = payload.get("prototype_plan", {})
+        return 0 if plan.get("status") == "success" else 2
 
     if args.command == "compare-db-snapshots":
         payload = service.compare_db_snapshots(
@@ -295,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
             before_snapshot=Path(args.before_snapshot),
             after_snapshot=Path(args.after_snapshot),
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print_json(payload)
         return 0
 
     if args.command == "hook-capture":
@@ -307,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_sec=args.timeout_sec,
             launch_sample=args.launch_sample,
         )
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        print_json(result.to_dict())
         print(f"hook_artifacts: {work_dir}")
         return 0 if result.ok else 2
 

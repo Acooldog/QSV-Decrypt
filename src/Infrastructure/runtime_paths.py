@@ -31,6 +31,22 @@ def get_default_qtplog_root() -> Path:
     return Path(r"C:\Users\01080\AppData\Roaming\IQIYI Video\LStyle\qtplog\ppslog")
 
 
+def get_default_localwebapp_cache_root() -> Path:
+    return Path(r"C:\Users\01080\AppData\Roaming\IQIYI Video\localwebapp\cache")
+
+
+def get_default_cube_log_paths() -> list[Path]:
+    root = Path(r"C:\Users\01080\AppData\Roaming\IQIYI Video\LStyle")
+    return [
+        root / "cube.log",
+        root / "cube_old.log",
+    ]
+
+
+def get_default_download_metadata_db_path() -> Path:
+    return Path(r"C:\Users\01080\AppData\Roaming\IQIYI Video\LStyle\PPSDownLoad.db")
+
+
 def get_default_qyclient_paths() -> list[Path]:
     return [
         Path(r"C:\Program Files\Common Files\IQIYI Video\LStyle\QyClient.exe"),

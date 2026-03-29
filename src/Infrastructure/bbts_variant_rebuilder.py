@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import shutil
 import re
 import subprocess
@@ -45,6 +46,9 @@ class BbtsVariantRebuilder:
     VIDEO_PID = 0x100
     PARAMETER_SET_TYPES = {32, 33, 34}
     VCL_TYPES = set(range(0, 32))
+    DEFAULT_SHORTLIST_LIMIT = 4
+    DEFAULT_DECODE_HEALTH_LIMIT = 2
+    DEFAULT_BODY_SKIPS = (2, 5)
 
     def __init__(self, ffmpeg_tools: FfmpegTools) -> None:
         self.ffmpeg_tools = ffmpeg_tools
@@ -65,6 +69,7 @@ class BbtsVariantRebuilder:
         segment_paths = sorted(segments_dir.glob("*.ts"))
         if not segment_paths:
             raise FileNotFoundError(f"No segment TS files found in {segments_dir}")
+        only_segments = self._parse_segment_filter(os.environ.get("AQY_BBTS_ONLY_SEGMENTS", ""))
 
         segment0_path = self._find_segment_path(segment_paths, 0)
         if segment0_path is None:
@@ -75,6 +80,7 @@ class BbtsVariantRebuilder:
         seg0_prefix = self._extract_parameter_prefix(seg0_layout.payload)
         if not seg0_prefix:
             raise RuntimeError("Unable to extract HEVC parameter prefix from segment 0")
+        current_prefix = seg0_prefix
 
         segment_results: list[BbtsRepairSegmentInfo] = []
         selected_segment_paths: list[Path] = []
@@ -115,10 +121,28 @@ class BbtsVariantRebuilder:
                 artifact_paths.append(copied_path)
                 continue
 
+            reused = self._load_existing_segment_result(
+                segment_index=segment_index,
+                segment_path=segment_path,
+                output_dir=segment_output_dir,
+                only_segments=only_segments,
+            )
+            if reused is not None:
+                segment_results.append(reused)
+                if reused.output_path is not None:
+                    selected_segment_paths.append(reused.output_path)
+                    artifact_paths.append(reused.output_path)
+                    reused_prefix = self._extract_selected_prefix(reused.output_path)
+                    if reused_prefix:
+                        current_prefix = reused_prefix
+                else:
+                    selected_segment_paths.append(segment_path)
+                continue
+
             result = self._repair_segment(
                 segment_index=segment_index,
                 segment_path=segment_path,
-                seg0_prefix=seg0_prefix,
+                bootstrap_prefix=current_prefix,
                 dispatch_entry=dispatch_map.get(segment_index, {}),
                 output_dir=segment_output_dir,
             )
@@ -126,8 +150,14 @@ class BbtsVariantRebuilder:
             if result.output_path is not None:
                 selected_segment_paths.append(result.output_path)
                 artifact_paths.append(result.output_path)
+                selected_prefix = self._extract_selected_prefix(result.output_path)
+                if selected_prefix:
+                    current_prefix = selected_prefix
             else:
                 selected_segment_paths.append(segment_path)
+                original_prefix = self._extract_selected_prefix(segment_path)
+                if original_prefix:
+                    current_prefix = original_prefix
                 notes.append(
                     f"Segment {segment_index} had no selected output; falling back to original segment bytes."
                 )
@@ -204,11 +234,48 @@ class BbtsVariantRebuilder:
         report.artifact_paths.append(report_path)
         return report
 
+    def _load_existing_segment_result(
+        self,
+        segment_index: int,
+        segment_path: Path,
+        output_dir: Path,
+        only_segments: set[int],
+    ) -> BbtsRepairSegmentInfo | None:
+        if only_segments and segment_index in only_segments:
+            return None
+        selected_output_path = output_dir / f"{segment_index:02d}.selected.ts"
+        if not selected_output_path.exists():
+            return None
+        probe = self.ffmpeg_tools.probe(selected_output_path)
+        return BbtsRepairSegmentInfo(
+            segment_index=segment_index,
+            input_path=segment_path,
+            output_path=selected_output_path,
+            selected_candidate=BbtsRepairCandidateInfo(
+                candidate_name="reused-existing",
+                key_hex="",
+                operation="reuse",
+                source="resume",
+                window_offset=0,
+                score=self._score_probe(probe),
+                video_duration_sec=self._video_duration(probe),
+                audio_duration_sec=self._audio_duration(probe),
+                width=self._video_width(probe),
+                height=self._video_height(probe),
+                nb_frames=self._video_frames(probe),
+                note="Reused previously selected segment output.",
+            ),
+            candidate_count=0,
+            top_candidates=[],
+            probe_summary=probe,
+            note="Segment reused from previous run.",
+        )
+
     def _repair_segment(
         self,
         segment_index: int,
         segment_path: Path,
-        seg0_prefix: bytes,
+        bootstrap_prefix: bytes,
         dispatch_entry: dict[str, object],
         output_dir: Path,
     ) -> BbtsRepairSegmentInfo:
@@ -245,14 +312,42 @@ class BbtsVariantRebuilder:
             note="Original segment without BBTS body transform.",
         )
         candidate_infos.append((identity_info, segment_path))
+        strip35_ts = self._patch_segment_bytes(
+            segment_bytes=original_bytes,
+            layout=layout,
+            parameter_prefix=bootstrap_prefix,
+            key=b"",
+            operation="identity",
+            strip_nal_types={35},
+        )
+        strip35_path = output_dir / f"{segment_index:02d}.strip_nal35.ts"
+        strip35_path.write_bytes(strip35_ts)
+        strip35_probe = self.ffmpeg_tools.probe(strip35_path)
+        strip35_info = BbtsRepairCandidateInfo(
+            candidate_name="strip_nal35",
+            key_hex="",
+            operation="strip_nal35",
+            source="bootstrap",
+            window_offset=0,
+            score=self._score_probe(strip35_probe),
+            video_duration_sec=self._video_duration(strip35_probe),
+            audio_duration_sec=self._audio_duration(strip35_probe),
+            width=self._video_width(strip35_probe),
+            height=self._video_height(strip35_probe),
+            nb_frames=self._video_frames(strip35_probe),
+            note="Removed HEVC NAL type 35 units before scoring.",
+        )
+        candidate_infos.append((strip35_info, strip35_path))
 
         for spec in candidate_specs:
             patched_ts = self._patch_segment_bytes(
                 segment_bytes=original_bytes,
                 layout=layout,
-                seg0_prefix=seg0_prefix,
+                parameter_prefix=bootstrap_prefix,
                 key=spec["key"],
                 operation=str(spec["operation"]),
+                body_skip=int(spec.get("body_skip") or 5),
+                strip_nal_types=set(spec.get("strip_nal_types") or []),
             )
             candidate_ts_path = output_dir / f"{segment_index:02d}.{spec['name']}.ts"
             candidate_ts_path.write_bytes(patched_ts)
@@ -269,7 +364,7 @@ class BbtsVariantRebuilder:
                 width=self._video_width(probe),
                 height=self._video_height(probe),
                 nb_frames=self._video_frames(probe),
-                note="Scored from direct ffprobe on patched TS.",
+                note=f"Scored from direct ffprobe on patched TS (body_skip={int(spec.get('body_skip') or 5)}).",
             )
             candidate_infos.append((info, candidate_ts_path))
 
@@ -302,13 +397,13 @@ class BbtsVariantRebuilder:
         max_probe_score = max(item[0].score for item in candidate_infos)
         shortlist: list[tuple[BbtsRepairCandidateInfo, Path]] = []
         for info, path in candidate_infos:
-            if len(shortlist) >= 8:
+            if len(shortlist) >= self.DEFAULT_SHORTLIST_LIMIT:
                 break
             if info.score + 2048 < max_probe_score:
                 continue
             shortlist.append((info, path))
         if not shortlist:
-            shortlist = candidate_infos[:4]
+            shortlist = candidate_infos[: self.DEFAULT_SHORTLIST_LIMIT]
         for info, path in shortlist:
             timestamps = self._sample_timestamps(info.video_duration_sec)
             frame_stats = self.ffmpeg_tools.sample_gray_frame_stats(path, timestamps)
@@ -326,6 +421,11 @@ class BbtsVariantRebuilder:
                     f"stddev_avg={info.frame_stddev_avg:.3f} "
                     f"dominant_max={info.dominant_ratio_max:.3f}."
                 )
+        shortlist.sort(
+            key=lambda item: (float(item[0].score) + float(item[0].visual_score), item[0].score),
+            reverse=True,
+        )
+        for info, path in shortlist[: self.DEFAULT_DECODE_HEALTH_LIMIT]:
             health = self.ffmpeg_tools.decode_video_health(path)
             info.decoded_video_sec = float(health.get("decoded_video_sec") or 0.0)
             info.decode_error_lines = int(health.get("decode_error_lines") or 0.0)
@@ -337,10 +437,15 @@ class BbtsVariantRebuilder:
     @staticmethod
     def _sample_timestamps(video_duration_sec: float) -> list[float]:
         if video_duration_sec <= 0:
-            return [1.0, 3.0, 5.0]
+            return [1.0, 4.0]
         if video_duration_sec < 15.0:
             return [max(0.0, video_duration_sec * ratio) for ratio in (0.15, 0.5, 0.85)]
-        return [max(0.5, video_duration_sec * ratio) for ratio in (0.12, 0.5, 0.88)]
+        return [
+            1.0,
+            max(0.5, video_duration_sec * 0.18),
+            max(0.5, video_duration_sec * 0.82),
+            max(1.0, video_duration_sec - 1.0),
+        ]
 
     @staticmethod
     def _visual_score(frame_stats: list[dict[str, float]]) -> float:
@@ -361,13 +466,23 @@ class BbtsVariantRebuilder:
         self,
         segment_bytes: bytes,
         layout: _TsPayloadLayout,
-        seg0_prefix: bytes,
+        parameter_prefix: bytes,
         key: bytes,
         operation: str,
+        body_skip: int = 5,
+        strip_nal_types: set[int] | None = None,
     ) -> bytes:
         patched_payload = bytearray(layout.payload)
-        self._inject_parameter_prefix(patched_payload, seg0_prefix)
-        self._transform_slice_nals(patched_payload, key=key, operation=operation)
+        self._inject_parameter_prefix(patched_payload, parameter_prefix)
+        if strip_nal_types:
+            patched_payload = bytearray(self._strip_nal_types(bytes(patched_payload), strip_nal_types))
+        if key:
+            self._transform_slice_nals(
+                patched_payload,
+                key=key,
+                operation=operation,
+                body_skip=body_skip,
+            )
         return self._write_video_payload(segment_bytes, layout.ranges, bytes(patched_payload))
 
     @classmethod
@@ -482,7 +597,7 @@ class BbtsVariantRebuilder:
         return payload[prefix_start:prefix_end]
 
     @classmethod
-    def _inject_parameter_prefix(cls, payload: bytearray, seg0_prefix: bytes) -> None:
+    def _inject_parameter_prefix(cls, payload: bytearray, parameter_prefix: bytes) -> None:
         nalus = cls._iter_nalus(bytes(payload))
         prefix_start: int | None = None
         prefix_end: int | None = None
@@ -495,18 +610,31 @@ class BbtsVariantRebuilder:
         if prefix_start is None or prefix_end is None or prefix_end <= prefix_start:
             return
         window_len = prefix_end - prefix_start
-        replacement = seg0_prefix[:window_len]
+        replacement = parameter_prefix[:window_len]
         if len(replacement) < window_len:
             replacement = replacement + payload[prefix_start + len(replacement) : prefix_start + window_len]
         payload[prefix_start:prefix_end] = replacement
 
+    def _extract_selected_prefix(self, path: Path) -> bytes:
+        try:
+            payload = self._extract_video_payload(path.read_bytes()).payload
+        except OSError:
+            return b""
+        return self._extract_parameter_prefix(payload)
+
     @classmethod
-    def _transform_slice_nals(cls, payload: bytearray, key: bytes, operation: str) -> None:
+    def _transform_slice_nals(
+        cls,
+        payload: bytearray,
+        key: bytes,
+        operation: str,
+        body_skip: int = 5,
+    ) -> None:
         cipher = Blowfish.new(key, Blowfish.MODE_ECB)
         for nal in cls._iter_nalus(bytes(payload)):
             if nal.nal_type not in cls.VCL_TYPES:
                 continue
-            body_offset = nal.nal_offset + 5
+            body_offset = nal.nal_offset + max(0, body_skip)
             if body_offset >= nal.nal_end:
                 continue
             body_len = nal.nal_end - body_offset
@@ -519,6 +647,17 @@ class BbtsVariantRebuilder:
             else:
                 transformed = cipher.decrypt(original)
             payload[body_offset : body_offset + block_len] = transformed
+
+    @classmethod
+    def _strip_nal_types(cls, payload: bytes, nal_types: set[int]) -> bytes:
+        if not nal_types:
+            return payload
+        output = bytearray()
+        for nal in cls._iter_nalus(payload):
+            if nal.nal_type in nal_types:
+                continue
+            output.extend(payload[nal.start_code_offset : nal.nal_end])
+        return bytes(output)
 
     @staticmethod
     def _score_probe(probe: ProbeSummary) -> int:
@@ -753,20 +892,118 @@ class BbtsVariantRebuilder:
 
     def _build_candidate_specs(self, dispatch_entry: dict[str, object]) -> list[dict[str, object]]:
         sources: list[tuple[str, bytes]] = []
-        dispatch_hex = str(dispatch_entry.get("dispatch_key_hex") or "").strip().lower()
+        sources.extend(self._collect_key_sources("dispatch", dispatch_entry.get("dispatch_key_hex"), dispatch_entry.get("dispatch_key_base64"), dispatch_entry.get("dispatch_urls", []) or []))
+        sources.extend(self._collect_key_sources("cube", dispatch_entry.get("cube_dispatch_key_hex"), dispatch_entry.get("cube_dispatch_key_base64"), dispatch_entry.get("cube_dispatch_urls", []) or []))
+
+        candidate_specs: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str, int]] = set()
+        enable_windows = os.environ.get("AQY_BBTS_ENABLE_WINDOWS", "").strip().lower() in {"1", "true", "yes"}
+        for source_name, key_bytes in sources:
+            if len(key_bytes) >= 8:
+                for body_skip in self.DEFAULT_BODY_SKIPS:
+                    for operation in ("decrypt", "encrypt"):
+                        full_name = f"{source_name}.full.{operation}.skip{body_skip}"
+                        identity = (full_name, key_bytes.hex(), operation, body_skip)
+                        if identity not in seen:
+                            candidate_specs.append(
+                                {
+                                    "name": full_name,
+                                    "key": key_bytes,
+                                    "operation": operation,
+                                    "source": source_name,
+                                    "window_offset": 0,
+                                    "body_skip": body_skip,
+                                }
+                            )
+                            seen.add(identity)
+                        strip35_name = f"{source_name}.full.{operation}.skip{body_skip}.strip35"
+                        strip35_identity = (strip35_name, key_bytes.hex(), operation, -(body_skip * 100 + 35))
+                        if strip35_identity not in seen:
+                            candidate_specs.append(
+                                {
+                                    "name": strip35_name,
+                                    "key": key_bytes,
+                                    "operation": operation,
+                                    "source": source_name,
+                                    "window_offset": 0,
+                                    "body_skip": body_skip,
+                                    "strip_nal_types": [35],
+                                }
+                            )
+                            seen.add(strip35_identity)
+                if enable_windows:
+                    for offset in range(0, len(key_bytes) - 7):
+                        window = key_bytes[offset : offset + 8]
+                        for body_skip in self.DEFAULT_BODY_SKIPS:
+                            for operation in ("decrypt", "encrypt"):
+                                name = f"{source_name}.w{offset:02d}.{operation}.skip{body_skip}"
+                                identity = (name, window.hex(), operation, (offset * 10) + body_skip)
+                                if identity in seen:
+                                    continue
+                                candidate_specs.append(
+                                    {
+                                        "name": name,
+                                        "key": window,
+                                        "operation": operation,
+                                        "source": source_name,
+                                        "window_offset": offset,
+                                        "body_skip": body_skip,
+                                    }
+                                )
+                                seen.add(identity)
+                                strip35_name = f"{source_name}.w{offset:02d}.{operation}.skip{body_skip}.strip35"
+                                strip35_identity = (strip35_name, window.hex(), operation, -((offset * 100) + (body_skip * 10) + 35))
+                                if strip35_identity in seen:
+                                    continue
+                                candidate_specs.append(
+                                    {
+                                        "name": strip35_name,
+                                        "key": window,
+                                        "operation": operation,
+                                        "source": source_name,
+                                        "window_offset": offset,
+                                        "body_skip": body_skip,
+                                        "strip_nal_types": [35],
+                                    }
+                                )
+                                seen.add(strip35_identity)
+        return candidate_specs
+
+    @staticmethod
+    def _parse_segment_filter(raw: str) -> set[int]:
+        result: set[int] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                result.add(int(part))
+            except ValueError:
+                continue
+        return result
+
+    def _collect_key_sources(
+        self,
+        prefix: str,
+        key_hex_value: object,
+        key_b64_value: object,
+        urls: list[object],
+    ) -> list[tuple[str, bytes]]:
+        sources: list[tuple[str, bytes]] = []
+        dispatch_hex = str(key_hex_value or "").strip().lower()
         if dispatch_hex:
             key_bytes = self._hex_to_bytes(dispatch_hex)
             if key_bytes:
-                sources.append(("dispatch_key_hex", key_bytes))
-        dispatch_b64 = str(dispatch_entry.get("dispatch_key_base64") or "").strip()
+                sources.append((f"{prefix}_key_hex", key_bytes))
+        dispatch_b64 = str(key_b64_value or "").strip()
         if dispatch_b64:
             try:
                 key_bytes = base64.b64decode(dispatch_b64)
             except Exception:
                 key_bytes = b""
             if key_bytes:
-                sources.append(("dispatch_key_base64", key_bytes))
-        for url in dispatch_entry.get("dispatch_urls", []) or []:
+                sources.append((f"{prefix}_key_base64", key_bytes))
+        for url in urls:
             if not isinstance(url, str):
                 continue
             parsed = urllib.parse.urlparse(url)
@@ -775,44 +1012,8 @@ class BbtsVariantRebuilder:
                 key_hex = raw_value.strip().lower()
                 key_bytes = self._hex_to_bytes(key_hex)
                 if key_bytes:
-                    sources.append(("dispatch_url_key", key_bytes))
-
-        candidate_specs: list[dict[str, object]] = []
-        seen: set[tuple[str, str, str, int]] = set()
-        for source_name, key_bytes in sources:
-            if len(key_bytes) >= 8:
-                for operation in ("decrypt", "encrypt"):
-                    full_name = f"{source_name}.full.{operation}"
-                    identity = (full_name, key_bytes.hex(), operation, 0)
-                    if identity not in seen:
-                        candidate_specs.append(
-                            {
-                                "name": full_name,
-                                "key": key_bytes,
-                                "operation": operation,
-                                "source": source_name,
-                                "window_offset": 0,
-                            }
-                        )
-                        seen.add(identity)
-                for offset in range(0, len(key_bytes) - 7):
-                    window = key_bytes[offset : offset + 8]
-                    for operation in ("decrypt", "encrypt"):
-                        name = f"{source_name}.w{offset:02d}.{operation}"
-                        identity = (name, window.hex(), operation, offset)
-                        if identity in seen:
-                            continue
-                        candidate_specs.append(
-                            {
-                                "name": name,
-                                "key": window,
-                                "operation": operation,
-                                "source": source_name,
-                                "window_offset": offset,
-                            }
-                        )
-                        seen.add(identity)
-        return candidate_specs
+                    sources.append((f"{prefix}_url_key", key_bytes))
+        return sources
 
     @staticmethod
     def _hex_to_bytes(value: str) -> bytes:
@@ -827,6 +1028,8 @@ class BbtsVariantRebuilder:
     @staticmethod
     def _load_dispatch_map(dispatch_json_path: Path) -> dict[int, dict[str, object]]:
         raw = json.loads(dispatch_json_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            raw = raw.get("segments") or []
         by_segnum: dict[int, dict[str, object]] = {}
         for item in raw:
             if not isinstance(item, dict):
@@ -843,6 +1046,14 @@ class BbtsVariantRebuilder:
                 "dispatch_key_hex",
                 "dispatch_key_base64",
                 "dispatch_urls",
+                "cube_dispatch_key_hex",
+                "cube_dispatch_key_base64",
+                "cube_dispatch_urls",
+                "cube_resource_names",
+                "cube_tvid",
+                "cube_vid",
+                "cube_cid",
+                "cube_qd_aid",
                 "run_offset",
                 "run_length",
                 "f4vsize",
